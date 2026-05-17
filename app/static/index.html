@@ -1,0 +1,396 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Voice AI Agent · Nova Sonic</title>
+  <style>
+    :root { --bg:#0b1020; --fg:#e6e8ef; --muted:#a9afc3; --accent:#6ee7b7; --danger:#f87171; --card:#11162a; }
+    *{box-sizing:border-box}
+    body{margin:0;min-height:100vh;display:grid;place-items:center;background:radial-gradient(80vw 80vh at 10% -10%,#172039,transparent),var(--bg);color:var(--fg);font:16px/1.45 -apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,Helvetica,Arial,sans-serif}
+    .container{max-width:600px;width:100%;padding:2rem;background:var(--card);border-radius:1rem;box-shadow:0 8px 32px rgba(0,0,0,0.3)}
+    h1{text-align:center;margin:0 0 2rem;font-size:1.5rem;color:var(--accent)}
+    .controls{display:flex;gap:1rem;justify-content:center;margin-bottom:2rem}
+    button{padding:0.75rem 1.5rem;border:none;border-radius:0.5rem;font-size:1rem;cursor:pointer;transition:all 0.2s;font-weight:500}
+    .record{background:var(--accent);color:var(--bg)}
+    .record:hover{background:#5dd1a0;transform:translateY(-1px)}
+    .record:active{transform:translateY(0)}
+    .record.recording{background:var(--danger);animation:pulse 1s infinite}
+    .clear{background:var(--muted);color:var(--bg)}
+    .clear:hover{background:#9ba5c7}
+    .status{text-align:center;padding:1rem;background:rgba(110,231,183,0.1);border-radius:0.5rem;margin-bottom:1rem;min-height:3rem;display:flex;align-items:center;justify-content:center}
+    .vu{width:100%;height:0.5rem;background:rgba(110,231,183,0.2);border-radius:0.25rem;overflow:hidden;margin-bottom:1rem}
+    .vu-bar{height:100%;background:linear-gradient(90deg,var(--accent),#fbbf24);transition:width 0.1s;width:0}
+    .debug{font-size:0.875rem;color:var(--muted);text-align:center;margin-top:1rem;padding:0.5rem;background:rgba(0,0,0,0.2);border-radius:0.25rem}
+    @keyframes pulse{0%,100%{opacity:1}50%{opacity:0.7}}
+    .hidden{display:none}
+  </style>
+</head>
+<body>
+  <div class="container">
+    <h1>🎤 Voice AI Agent</h1>
+    
+    <div class="status" id="status">Ready to listen</div>
+    
+    <div class="vu">
+      <div class="vu-bar" id="vu"></div>
+    </div>
+    
+    <div class="controls">
+      <button id="recordBtn" class="record">🎤 Start Recording</button>
+      <button id="clearBtn" class="clear">🗑️ Clear</button>
+    </div>
+    
+    <div class="debug" id="debug">
+      <div>Sample Rate: <span id="sampleRate">-</span></div>
+      <div>Chunks: <span id="chunkCount">0</span> | Queue: <span id="queueSize">0</span></div>
+      <div>Output WS: <span id="outputWSStatus">disconnected</span></div>
+      <div>Input WS: <span id="inputWSStatus">disconnected</span></div>
+    </div>
+  </div>
+
+<script>
+(() => {
+  // ---- Config ----
+  const WS_BASE = (location.origin.replace(/^http/, 'ws'));
+  const USER_INPUT_URL = `${WS_BASE}/ws/user_input`;
+  const SPEECH_OUTPUT_URL = `${WS_BASE}/ws/speech_output`;
+
+  const INPUT_SAMPLE_RATE = 16000;  // Send to Nova at 16kHz
+  const OUTPUT_SAMPLE_RATE = 24000; // Nova outputs at 24kHz
+
+  // ---- Elements ----
+  const recordBtn = document.getElementById('recordBtn');
+  const clearBtn = document.getElementById('clearBtn');
+  const statusEl = document.getElementById('status');
+  const vuBar = document.getElementById('vu');
+
+  // ---- State ----
+  let inputWS, outputWS;
+  let inputCtx, outputCtx, procNode;
+  let chunkCount = 0;
+
+  // Accumulate PCM samples and play in larger batches for smooth audio
+  let pendingSamples = [];
+  let nextPlayTime = 0;
+  let flushTimer = null;
+  const FLUSH_INTERVAL_MS = 150;  // Batch audio into ~150ms chunks
+  const MIN_BUFFER_MS = 100;      // Minimum buffer before starting playback
+
+  // ---- Utils ----
+  function setStatus(msg) {
+    statusEl.textContent = msg;
+    console.log(`[Status] ${msg}`);
+  }
+
+  function log(msg, ...args) {
+    console.log(`[VoiceAI] ${msg}`, ...args);
+  }
+
+  function updateDebugInfo() {
+    document.getElementById('sampleRate').textContent = outputCtx ? `${outputCtx.sampleRate}Hz` : '-';
+    document.getElementById('chunkCount').textContent = chunkCount;
+    document.getElementById('queueSize').textContent = pendingSamples.length;
+    document.getElementById('outputWSStatus').textContent = outputWS?.readyState === 1 ? 'connected' : 'disconnected';
+    document.getElementById('inputWSStatus').textContent = inputWS?.readyState === 1 ? 'connected' : 'disconnected';
+  }
+
+  // ---- Audio Processing ----
+  async function ensureOutputContext() {
+    if (!outputCtx) {
+      // Let the browser choose the optimal sample rate, don't force it
+      outputCtx = new (window.AudioContext || window.webkitAudioContext)();
+      log(`Output audio context created at ${outputCtx.sampleRate}Hz`);
+    }
+    if (outputCtx.state === 'suspended') {
+      await outputCtx.resume();
+    }
+    return outputCtx;
+  }
+
+  async function ensureInputContext() {
+    if (!inputCtx) {
+      inputCtx = new (window.AudioContext || window.webkitAudioContext)();
+      log(`Input audio context created at ${inputCtx.sampleRate}Hz`);
+    }
+    if (inputCtx.state === 'suspended') {
+      await inputCtx.resume();
+    }
+    return inputCtx;
+  }
+
+  function resample(input, fromRate, toRate) {
+    if (Math.abs(fromRate - toRate) < 100) return input; // Close enough, avoid resampling
+    
+    const ratio = fromRate / toRate;
+    const outputLength = Math.round(input.length / ratio);
+    const output = new Float32Array(outputLength);
+    
+    // Simple linear interpolation
+    for (let i = 0; i < outputLength; i++) {
+      const srcPos = i * ratio;
+      const srcIndex = Math.floor(srcPos);
+      const fraction = srcPos - srcIndex;
+      
+      if (srcIndex + 1 < input.length) {
+        output[i] = input[srcIndex] * (1 - fraction) + input[srcIndex + 1] * fraction;
+      } else {
+        output[i] = input[srcIndex] || 0;
+      }
+    }
+    
+    return output;
+  }
+
+  async function processAudioChunk(int16Array) {
+    try {
+      const ctx = await ensureOutputContext();
+
+      const float32 = new Float32Array(int16Array.length);
+      for (let i = 0; i < int16Array.length; i++) {
+        float32[i] = int16Array[i] / 32768.0;
+      }
+
+      let finalSamples = float32;
+      if (Math.abs(OUTPUT_SAMPLE_RATE - ctx.sampleRate) > 100) {
+        finalSamples = resample(float32, OUTPUT_SAMPLE_RATE, ctx.sampleRate);
+      }
+
+      pendingSamples.push(finalSamples);
+      chunkCount++;
+      scheduleFlush();
+      updateDebugInfo();
+    } catch (error) {
+      log('Error processing audio chunk:', error);
+    }
+  }
+
+  function scheduleFlush() {
+    if (flushTimer) return;
+    flushTimer = setTimeout(() => {
+      flushTimer = null;
+      flushAudio();
+    }, FLUSH_INTERVAL_MS);
+  }
+
+  function flushAudio() {
+    if (flushTimer) { clearTimeout(flushTimer); flushTimer = null; }
+    if (pendingSamples.length === 0) return;
+
+    const ctx = outputCtx;
+    if (!ctx) return;
+
+    let totalLen = 0;
+    for (const s of pendingSamples) totalLen += s.length;
+    const merged = new Float32Array(totalLen);
+    let offset = 0;
+    for (const s of pendingSamples) {
+      merged.set(s, offset);
+      offset += s.length;
+    }
+    pendingSamples = [];
+
+    const buffer = ctx.createBuffer(1, merged.length, ctx.sampleRate);
+    buffer.copyToChannel(merged, 0);
+
+    const now = ctx.currentTime;
+    if (nextPlayTime < now) {
+      nextPlayTime = now + MIN_BUFFER_MS / 1000;
+    }
+
+    const source = ctx.createBufferSource();
+    source.buffer = buffer;
+    source.connect(ctx.destination);
+    source.start(nextPlayTime);
+
+    log(`Scheduled ${(buffer.duration * 1000).toFixed(0)}ms audio at T+${((nextPlayTime - now) * 1000).toFixed(0)}ms`);
+    nextPlayTime += buffer.duration;
+    updateDebugInfo();
+  }
+
+  function clearAudioQueue() {
+    pendingSamples = [];
+    if (flushTimer) { clearTimeout(flushTimer); flushTimer = null; }
+    if (outputCtx) {
+      nextPlayTime = outputCtx.currentTime;
+    }
+    updateDebugInfo();
+    log('Audio queue cleared');
+  }
+
+  // ---- WebSocket Management ----
+  function connectOutputSocket() {
+    outputWS = new WebSocket(SPEECH_OUTPUT_URL);
+    outputWS.binaryType = 'arraybuffer';
+    
+    outputWS.onopen = () => {
+      log('🔊 Output WebSocket connected');
+      updateDebugInfo();
+    };
+    
+    outputWS.onclose = () => {
+      log('🔇 Output WebSocket disconnected');
+      updateDebugInfo();
+    };
+    
+    outputWS.onerror = (e) => {
+      log('Output WebSocket error:', e);
+      updateDebugInfo();
+    };
+
+    outputWS.onmessage = async (evt) => {
+      if (typeof evt.data === 'string') {
+        try {
+          const msg = JSON.parse(evt.data);
+          log('Control message:', msg);
+          
+          if (msg.control === 'clear_audio') {
+            clearAudioQueue();
+            setStatus('Audio cleared (barge-in)');
+          }
+          if (msg.control === 'flush_audio') {
+            flushAudio();
+          }
+          if (msg.status && msg.status !== 'connected') {
+            setStatus(msg.status);
+          }
+        } catch (e) {
+          log('Non-JSON control message:', evt.data);
+        }
+        return;
+      }
+      
+      // Binary audio data
+      const int16Array = new Int16Array(evt.data);
+      log(`Received ${int16Array.length} audio samples (${evt.data.byteLength} bytes)`);
+      await processAudioChunk(int16Array);
+      setStatus('Playing audio response');
+    };
+  }
+
+  async function connectInputSocket(stream) {
+    inputWS = new WebSocket(USER_INPUT_URL);
+    
+    inputWS.onopen = () => {
+      log('🎤 Input WebSocket connected');
+      updateDebugInfo();
+    };
+    
+    inputWS.onclose = () => {
+      log('🛑 Input WebSocket disconnected');
+      updateDebugInfo();
+    };
+    
+    inputWS.onerror = (e) => {
+      log('Input WebSocket error:', e);
+      updateDebugInfo();
+    };
+
+    const ctx = await ensureInputContext();
+    const source = ctx.createMediaStreamSource(stream);
+    procNode = ctx.createScriptProcessor(4096, 1, 1);
+    
+    source.connect(procNode);
+    procNode.connect(ctx.destination);
+
+    procNode.onaudioprocess = (e) => {
+      if (!inputWS || inputWS.readyState !== WebSocket.OPEN) return;
+      
+      const inputData = e.inputBuffer.getChannelData(0);
+      
+      // Resample to 16kHz for Nova
+      const resampled = resample(inputData, ctx.sampleRate, INPUT_SAMPLE_RATE);
+      
+      // Convert to PCM16
+      const pcm16 = new Int16Array(resampled.length);
+      for (let i = 0; i < resampled.length; i++) {
+        const sample = Math.max(-1, Math.min(1, resampled[i]));
+        pcm16[i] = Math.round(sample * 32767);
+      }
+      
+      // Send as base64
+      const bytes = new Uint8Array(pcm16.buffer);
+      const base64 = btoa(String.fromCharCode.apply(null, bytes));
+      inputWS.send(base64);
+      
+      // Update VU meter
+      let sum = 0;
+      for (let i = 0; i < resampled.length; i++) {
+        sum += resampled[i] * resampled[i];
+      }
+      const rms = Math.sqrt(sum / resampled.length);
+      vuBar.style.width = `${Math.min(100, rms * 500)}%`;
+    };
+  }
+
+  // ---- Event Handlers ----
+  recordBtn.addEventListener('click', async () => {
+    if (recordBtn.classList.contains('recording')) {
+      // Stop recording
+      recordBtn.classList.remove('recording');
+      recordBtn.textContent = '🎤 Start Recording';
+      setStatus('Stopped');
+      
+      // Flush remaining buffered audio before closing
+      flushAudio();
+
+      if (inputWS) {
+        inputWS.send('STOP');
+        inputWS.close();
+        inputWS = null;
+      }
+      
+      if (outputWS) {
+        outputWS.close();
+        outputWS = null;
+      }
+      
+      if (procNode) {
+        procNode.disconnect();
+        procNode = null;
+      }
+      
+      updateDebugInfo();
+      
+    } else {
+      // Start recording
+      try {
+        setStatus('Requesting microphone access...');
+        
+        const stream = await navigator.mediaDevices.getUserMedia({
+          audio: {
+            channelCount: 1,
+            echoCancellation: true,
+            noiseSuppression: true,
+            autoGainControl: true
+          }
+        });
+        
+        recordBtn.classList.add('recording');
+        recordBtn.textContent = '⏹️ Stop Recording';
+        setStatus('Listening... Speak now!');
+        
+        connectOutputSocket();
+        await connectInputSocket(stream);
+        
+      } catch (error) {
+        log('Microphone access error:', error);
+        setStatus('Error: Could not access microphone');
+      }
+    }
+  });
+
+  clearBtn.addEventListener('click', () => {
+    clearAudioQueue();
+    chunkCount = 0;
+    setStatus('Cleared');
+    updateDebugInfo();
+  });
+
+  // Initialize
+  updateDebugInfo();
+  setStatus('Click "Start Recording" to begin');
+})();
+</script>
+</body>
+</html>
